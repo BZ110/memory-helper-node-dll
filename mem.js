@@ -8,7 +8,7 @@
  *
  * The goal is to provide **ergonomic objects** instead of loose primitives.
  *
- * ✅ Everything returned is a **class instance**:
+ * Everything returned is a **class instance**:
  * - `findProcessesByName()` returns `ProcessList`
  * - `new Service("DcomLaunch")` returns `Service`
  * - `service.process()` returns `Process`
@@ -21,7 +21,7 @@
  *
  * By default, `Process` uses:
  *
- * - `autoClose: true` ✅
+ * - `autoClose: true`
  *
  * Meaning:
  *
