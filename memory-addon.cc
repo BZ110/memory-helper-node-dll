@@ -1,120 +1,124 @@
 #include <napi.h>
 #include <windows.h>
 
-// ---- DLL typedefs -------------------------------------------------------
+#include <cstdint>
+#include <cstdlib>
+#include <string>
 
-typedef HANDLE (*OpenProcessForNodeFunc)(DWORD);
-typedef BOOL   (*ReadMemoryForNodeFunc)(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_T*);
-typedef BOOL   (*CloseHandleForNodeFunc)(HANDLE);
-typedef DWORD  (*FindPidsByExeNameAFunc)(const char*, DWORD*, DWORD, BOOL);
-typedef DWORD  (*FindServicePidAFunc)(const char*);
-typedef void   (*ScanCallback)(UINT64,const char*,const char*);
+using OpenProcessFn = HANDLE (*)(DWORD);
+using ReadMemoryFn = BOOL (*)(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_T *);
+using CloseHandleFn = BOOL (*)(HANDLE);
+using FindPidsFn = DWORD (*)(const char *, DWORD *, DWORD, BOOL);
+using FindServicePidFn = DWORD (*)(const char *);
+using ScanCallback = void (*)(UINT64, const char *, const char *);
 
-typedef struct {
+struct ScanStringOptions {
     UINT64 start;
     UINT64 end;
     UINT32 minLen;
-    BOOL   ascii;
-    BOOL   utf16;
-    BOOL   caseSensitive;
+    BOOL ascii;
+    BOOL utf16;
+    BOOL caseSensitive;
     const char *contains;
     SIZE_T maxResults;
-} ScanStringOptions;
+};
 
-typedef DWORD (*ScanStringsForNodeFunc)(HANDLE, ScanStringOptions*, ScanCallback);
+using ScanStringsFn = DWORD (*)(HANDLE, ScanStringOptions *, ScanCallback);
 
-// ---- Globals ------------------------------------------------------------
+static HMODULE helperDll = nullptr;
+static OpenProcessFn openProcessFn = nullptr;
+static ReadMemoryFn readMemoryFn = nullptr;
+static CloseHandleFn closeHandleFn = nullptr;
+static FindPidsFn findPidsFn = nullptr;
+static FindServicePidFn findServicePidFn = nullptr;
+static ScanStringsFn scanStringsFn = nullptr;
 
-static HMODULE gDLL           = NULL;
-static OpenProcessForNodeFunc  pOpenProcess = NULL;
-static ReadMemoryForNodeFunc   pReadMemory  = NULL;
-static CloseHandleForNodeFunc  pCloseHandle = NULL;
-static FindPidsByExeNameAFunc  pFindPids    = NULL;
-static FindServicePidAFunc     pFindService = NULL;
-static ScanStringsForNodeFunc  pScanStrings = NULL;
+/* scanStrings is synchronous, so a small bridge like this is enough here. */
+static Napi::Env *scanEnv = nullptr;
+static Napi::Array *scanResults = nullptr;
+static uint32_t scanResultIndex = 0;
 
-// ---- JS result buffer for scanStrings ----------------------------------
+static void onScanResult(UINT64 address,
+                         const char *text,
+                         const char *encoding)
+{
+    if (!scanEnv || !scanResults)
+        return;
 
-static Napi::Env*   gEnv = nullptr;
-static Napi::Array* gArr = nullptr;
-static uint32_t     gIdx = 0;
+    Napi::Object hit = Napi::Object::New(*scanEnv);
+    hit.Set("address", Napi::BigInt::New(*scanEnv, address));
+    hit.Set("text", Napi::String::New(*scanEnv, text ? text : ""));
+    hit.Set("encoding", Napi::String::New(*scanEnv,
+                                           encoding ? encoding : "ascii"));
 
-static void BridgeScanHit(UINT64 addr, const char* text, const char* encoding) {
-    // Called synchronously from ScanStringsForNode on the same thread
-    if (!gEnv || !gArr) return;
-
-    Napi::Object o = Napi::Object::New(*gEnv);
-    o.Set("address", Napi::BigInt::New(*gEnv, addr));
-    o.Set("text",    Napi::String::New(*gEnv, text ? text : ""));
-    o.Set("encoding",Napi::String::New(*gEnv, encoding ? encoding : "ascii"));
-    gArr->Set(gIdx++, o);
+    scanResults->Set(scanResultIndex++, hit);
 }
 
-// ---- Helper: guard that DLL and function pointers exist ----------------
-
-static void EnsureLoadedOrThrow(const Napi::Env& env) {
-    if (!gDLL) {
-        Napi::Error::New(env,
-            "memory-helper.dll failed to load. Make sure it is in the same "
-            "folder as memory.node or in PATH.")
-            .ThrowAsJavaScriptException();
-        return;
+static bool checkHelperLoaded(Napi::Env env)
+{
+    if (!helperDll) {
+        Napi::Error::New(
+            env,
+            "Could not load memory-helper.dll. Put it next to memory.node "
+            "or make sure its directory is in PATH."
+        ).ThrowAsJavaScriptException();
+        return false;
     }
 
-    if (!pOpenProcess || !pReadMemory || !pCloseHandle || !pFindPids ||
-        !pFindService || !pScanStrings) {
-        Napi::Error::New(env,
-            "memory-helper.dll is loaded but required exports are missing. "
-            "Check that it was built with the correct functions (OpenProcessForNode, "
-            "ReadMemoryForNode, CloseHandleForNode, FindPidsByExeNameA, "
-            "FindServicePidA, ScanStringsForNode).")
-            .ThrowAsJavaScriptException();
-        return;
+    if (!openProcessFn || !readMemoryFn || !closeHandleFn ||
+        !findPidsFn || !findServicePidFn || !scanStringsFn) {
+        Napi::Error::New(
+            env,
+            "memory-helper.dll loaded, but one or more required exports "
+            "could not be found."
+        ).ThrowAsJavaScriptException();
+        return false;
     }
+
+    return true;
 }
 
-// ---- openProcess(pid:number) -> bigint ---------------------------------
-
-Napi::Value OpenProcessWrapped(const Napi::CallbackInfo& info) {
+static Napi::Value openProcess(const Napi::CallbackInfo &info)
+{
     Napi::Env env = info.Env();
-    EnsureLoadedOrThrow(env);
-    if (env.IsExceptionPending()) return env.Null();
+    if (!checkHelperLoaded(env))
+        return env.Null();
 
     if (info.Length() < 1 || !info[0].IsNumber())
         return env.Null();
 
     DWORD pid = info[0].As<Napi::Number>().Uint32Value();
-    HANDLE h = pOpenProcess(pid);
+    HANDLE handle = openProcessFn(pid);
 
-    return Napi::BigInt::New(env, (uint64_t)(uintptr_t)h);
+    return Napi::BigInt::New(env,
+                             static_cast<uint64_t>(
+                                 reinterpret_cast<uintptr_t>(handle)));
 }
 
-// ---- closeHandle(handle:bigint) -> boolean ------------------------------
-
-Napi::Value CloseHandleWrapped(const Napi::CallbackInfo& info) {
+static Napi::Value closeHandle(const Napi::CallbackInfo &info)
+{
     Napi::Env env = info.Env();
-    EnsureLoadedOrThrow(env);
-    if (env.IsExceptionPending()) return env.Null();
+    if (!checkHelperLoaded(env))
+        return env.Null();
 
     if (info.Length() < 1 || !info[0].IsBigInt())
         return Napi::Boolean::New(env, false);
 
-    bool loss = false;
-    uint64_t hv = info[0].As<Napi::BigInt>().Uint64Value(&loss);
-    HANDLE h = (HANDLE)(uintptr_t)hv;
+    bool lossless = false;
+    uint64_t rawHandle = info[0].As<Napi::BigInt>().Uint64Value(&lossless);
+    HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(rawHandle));
 
-    if (!h) return Napi::Boolean::New(env, false);
+    if (!handle)
+        return Napi::Boolean::New(env, false);
 
-    BOOL ok = pCloseHandle(h);
-    return Napi::Boolean::New(env, ok ? true : false);
+    return Napi::Boolean::New(env, closeHandleFn(handle) != FALSE);
 }
 
-// ---- readMemory(handle, addr, size) -> Buffer|null ----------------------
-
-Napi::Value ReadMemoryWrapped(const Napi::CallbackInfo& info) {
+static Napi::Value readMemory(const Napi::CallbackInfo &info)
+{
     Napi::Env env = info.Env();
-    EnsureLoadedOrThrow(env);
-    if (env.IsExceptionPending()) return env.Null();
+    if (!checkHelperLoaded(env))
+        return env.Null();
 
     if (info.Length() < 3 ||
         !info[0].IsBigInt() ||
@@ -123,175 +127,187 @@ Napi::Value ReadMemoryWrapped(const Napi::CallbackInfo& info) {
         return env.Null();
     }
 
-    bool l1 = false, l2 = false;
-    uint64_t hv   = info[0].As<Napi::BigInt>().Uint64Value(&l1);
-    uint64_t addr = info[1].As<Napi::BigInt>().Uint64Value(&l2);
-    SIZE_T size   = (SIZE_T)info[2].As<Napi::Number>().Uint32Value();
+    bool handleLossless = false;
+    bool addressLossless = false;
 
-    if (!hv || !addr || size == 0)
+    uint64_t rawHandle = info[0].As<Napi::BigInt>().Uint64Value(&handleLossless);
+    uint64_t rawAddress = info[1].As<Napi::BigInt>().Uint64Value(&addressLossless);
+    SIZE_T requested = static_cast<SIZE_T>(
+        info[2].As<Napi::Number>().Uint32Value());
+
+    if (!rawHandle || !rawAddress || requested == 0)
         return env.Null();
 
-    char *buf = (char*)malloc(size);
-    if (!buf) return env.Null();
+    char *buffer = static_cast<char *>(std::malloc(requested));
+    if (!buffer)
+        return env.Null();
 
-    SIZE_T br = 0;
-    BOOL ok = pReadMemory((HANDLE)(uintptr_t)hv, (LPCVOID)(uintptr_t)addr, buf, size, &br);
+    SIZE_T bytesRead = 0;
+    BOOL ok = readMemoryFn(
+        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(rawHandle)),
+        reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(rawAddress)),
+        buffer,
+        requested,
+        &bytesRead
+    );
 
-    if (!ok || br == 0) {
-        free(buf);
+    if (!ok || bytesRead == 0) {
+        std::free(buffer);
         return env.Null();
     }
 
-    Napi::Buffer<char> out = Napi::Buffer<char>::Copy(env, buf, (size_t)br);
-    free(buf);
-    return out;
+    auto result = Napi::Buffer<char>::Copy(env, buffer, bytesRead);
+    std::free(buffer);
+    return result;
 }
 
-// ---- findPidsByExeName(name:string) -> number[] -------------------------
-
-Napi::Value FindPidsWrapped(const Napi::CallbackInfo& info) {
+static Napi::Value findPidsByExeName(const Napi::CallbackInfo &info)
+{
     Napi::Env env = info.Env();
-    EnsureLoadedOrThrow(env);
-    if (env.IsExceptionPending()) return env.Null();
+    if (!checkHelperLoaded(env))
+        return env.Null();
 
     if (info.Length() < 1 || !info[0].IsString())
-        return Napi::Array::New(env, 0);
+        return Napi::Array::New(env);
 
-    std::string exe = info[0].As<Napi::String>().Utf8Value();
+    std::string exeName = info[0].As<Napi::String>().Utf8Value();
 
-    DWORD arr[256] = {0};
-    DWORD hits = pFindPids(exe.c_str(), arr, 256, TRUE);
+    DWORD pids[256] = {0};
+    DWORD found = findPidsFn(exeName.c_str(), pids, 256, TRUE);
+    DWORD returned = found < 256 ? found : 256;
 
-    Napi::Array out = Napi::Array::New(env, hits);
-    for (DWORD i = 0; i < hits; i++) {
-        out.Set(i, Napi::Number::New(env, arr[i]));
-    }
+    Napi::Array result = Napi::Array::New(env, returned);
+    for (DWORD i = 0; i < returned; ++i)
+        result.Set(i, Napi::Number::New(env, pids[i]));
 
-    return out;
+    return result;
 }
 
-// ---- findServicePid(name:string) -> number ------------------------------
-
-Napi::Value FindServiceWrapped(const Napi::CallbackInfo& info) {
+static Napi::Value findServicePid(const Napi::CallbackInfo &info)
+{
     Napi::Env env = info.Env();
-    EnsureLoadedOrThrow(env);
-    if (env.IsExceptionPending()) return env.Null();
+    if (!checkHelperLoaded(env))
+        return env.Null();
 
     if (info.Length() < 1 || !info[0].IsString())
         return Napi::Number::New(env, 0);
 
-    std::string svc = info[0].As<Napi::String>().Utf8Value();
-    DWORD pid = pFindService(svc.c_str());
-    return Napi::Number::New(env, pid);
+    std::string serviceName = info[0].As<Napi::String>().Utf8Value();
+    return Napi::Number::New(env, findServicePidFn(serviceName.c_str()));
 }
 
-// ---- scanStrings(handle, options?) -> hit[] ----------------------------
-
-Napi::Value ScanStringsWrapped(const Napi::CallbackInfo& info) {
+static Napi::Value scanStrings(const Napi::CallbackInfo &info)
+{
     Napi::Env env = info.Env();
-    EnsureLoadedOrThrow(env);
-    if (env.IsExceptionPending()) return env.Null();
+    if (!checkHelperLoaded(env))
+        return env.Null();
 
-    if (info.Length() < 1 || !info[0].IsBigInt()) {
-        return Napi::Array::New(env, 0);
-    }
+    if (info.Length() < 1 || !info[0].IsBigInt())
+        return Napi::Array::New(env);
 
-    bool loss = false;
-    uint64_t hv = info[0].As<Napi::BigInt>().Uint64Value(&loss);
-    HANDLE h = (HANDLE)(uintptr_t)hv;
-    if (!h) return Napi::Array::New(env, 0);
+    bool lossless = false;
+    uint64_t rawHandle = info[0].As<Napi::BigInt>().Uint64Value(&lossless);
+    HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(rawHandle));
 
-    ScanStringOptions opt;
-    opt.start         = 0;
-    opt.end           = 0x7fffffffffffULL;
-    opt.minLen        = 4;
-    opt.ascii         = TRUE;
-    opt.utf16         = TRUE;
-    opt.caseSensitive = FALSE;
-    opt.contains      = NULL;
-    opt.maxResults    = 1024;
+    if (!handle)
+        return Napi::Array::New(env);
 
-    // Keep 'contains' alive while scan runs
-    std::string containsStr;
+    ScanStringOptions options{};
+    options.start = 0;
+    options.end = 0x7fffffffffffULL;
+    options.minLen = 4;
+    options.ascii = TRUE;
+    options.utf16 = TRUE;
+    options.caseSensitive = FALSE;
+    options.contains = nullptr;
+    options.maxResults = 1024;
+
+    std::string contains;
 
     if (info.Length() > 1 && info[1].IsObject()) {
-        Napi::Object o = info[1].As<Napi::Object>();
+        Napi::Object input = info[1].As<Napi::Object>();
 
-        if (o.Has("start") && o.Get("start").IsBigInt()) {
-            bool l = false;
-            uint64_t s = o.Get("start").As<Napi::BigInt>().Uint64Value(&l);
-            opt.start = s;
-        }
-        if (o.Has("end") && o.Get("end").IsBigInt()) {
-            bool l = false;
-            uint64_t e = o.Get("end").As<Napi::BigInt>().Uint64Value(&l);
-            opt.end = e;
+        if (input.Has("start") && input.Get("start").IsBigInt()) {
+            bool ignored = false;
+            options.start = input.Get("start")
+                                .As<Napi::BigInt>()
+                                .Uint64Value(&ignored);
         }
 
-        if (o.Has("contains") && o.Get("contains").IsString()) {
-            containsStr = o.Get("contains").As<Napi::String>().Utf8Value();
-            if (!containsStr.empty()) {
-                opt.contains = containsStr.c_str();
-            }
+        if (input.Has("end") && input.Get("end").IsBigInt()) {
+            bool ignored = false;
+            options.end = input.Get("end")
+                              .As<Napi::BigInt>()
+                              .Uint64Value(&ignored);
         }
-        if (o.Has("minLength")) {
-            opt.minLen = o.Get("minLength").As<Napi::Number>().Uint32Value();
+
+        if (input.Has("contains") && input.Get("contains").IsString()) {
+            contains = input.Get("contains").As<Napi::String>().Utf8Value();
+            if (!contains.empty())
+                options.contains = contains.c_str();
         }
-        if (o.Has("ascii")) {
-            opt.ascii = o.Get("ascii").As<Napi::Boolean>().Value() ? TRUE : FALSE;
-        }
-        if (o.Has("utf16")) {
-            opt.utf16 = o.Get("utf16").As<Napi::Boolean>().Value() ? TRUE : FALSE;
-        }
-        if (o.Has("caseSensitive")) {
-            opt.caseSensitive = o.Get("caseSensitive").As<Napi::Boolean>().Value() ? TRUE : FALSE;
-        }
-        if (o.Has("maxResults")) {
-            opt.maxResults = (SIZE_T)o.Get("maxResults").As<Napi::Number>().Uint32Value();
-        }
+
+        if (input.Has("minLength") && input.Get("minLength").IsNumber())
+            options.minLen = input.Get("minLength").As<Napi::Number>().Uint32Value();
+
+        if (input.Has("ascii") && input.Get("ascii").IsBoolean())
+            options.ascii = input.Get("ascii").As<Napi::Boolean>().Value() ? TRUE : FALSE;
+
+        if (input.Has("utf16") && input.Get("utf16").IsBoolean())
+            options.utf16 = input.Get("utf16").As<Napi::Boolean>().Value() ? TRUE : FALSE;
+
+        if (input.Has("caseSensitive") && input.Get("caseSensitive").IsBoolean())
+            options.caseSensitive = input.Get("caseSensitive")
+                                        .As<Napi::Boolean>()
+                                        .Value() ? TRUE : FALSE;
+
+        if (input.Has("maxResults") && input.Get("maxResults").IsNumber())
+            options.maxResults = static_cast<SIZE_T>(
+                input.Get("maxResults").As<Napi::Number>().Uint32Value());
     }
 
-    Napi::Array arr = Napi::Array::New(env);
-    gEnv = &env;
-    gArr = &arr;
-    gIdx = 0;
+    Napi::Array results = Napi::Array::New(env);
 
-    if (pScanStrings) {
-        pScanStrings(h, &opt, BridgeScanHit);
-    }
+    scanEnv = &env;
+    scanResults = &results;
+    scanResultIndex = 0;
 
-    // Clear globals
-    gEnv = nullptr;
-    gArr = nullptr;
+    scanStringsFn(handle, &options, onScanResult);
 
-    return arr;
+    scanEnv = nullptr;
+    scanResults = nullptr;
+    scanResultIndex = 0;
+
+    return results;
 }
 
-// ---- Init ---------------------------------------------------------------
+static Napi::Object init(Napi::Env env, Napi::Object exports)
+{
+    helperDll = LoadLibraryA("memory-helper.dll");
 
-Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    // Load the helper DLL from the same directory (or PATH)
-    gDLL = LoadLibraryA("memory-helper.dll");
-    if (!gDLL) {
-        // Don't throw here; allow JS to require() successfully and fail lazily
-        // so it's easier to diagnose (we throw when a function is actually used).
-    } else {
-        pOpenProcess = (OpenProcessForNodeFunc) GetProcAddress(gDLL, "OpenProcessForNode");
-        pReadMemory  = (ReadMemoryForNodeFunc)  GetProcAddress(gDLL, "ReadMemoryForNode");
-        pCloseHandle = (CloseHandleForNodeFunc) GetProcAddress(gDLL, "CloseHandleForNode");
-        pFindPids    = (FindPidsByExeNameAFunc) GetProcAddress(gDLL, "FindPidsByExeNameA");
-        pFindService = (FindServicePidAFunc)    GetProcAddress(gDLL, "FindServicePidA");
-        pScanStrings = (ScanStringsForNodeFunc) GetProcAddress(gDLL, "ScanStringsForNode");
+    if (helperDll) {
+        openProcessFn = reinterpret_cast<OpenProcessFn>(
+            GetProcAddress(helperDll, "OpenProcessForNode"));
+        readMemoryFn = reinterpret_cast<ReadMemoryFn>(
+            GetProcAddress(helperDll, "ReadMemoryForNode"));
+        closeHandleFn = reinterpret_cast<CloseHandleFn>(
+            GetProcAddress(helperDll, "CloseHandleForNode"));
+        findPidsFn = reinterpret_cast<FindPidsFn>(
+            GetProcAddress(helperDll, "FindPidsByExeNameA"));
+        findServicePidFn = reinterpret_cast<FindServicePidFn>(
+            GetProcAddress(helperDll, "FindServicePidA"));
+        scanStringsFn = reinterpret_cast<ScanStringsFn>(
+            GetProcAddress(helperDll, "ScanStringsForNode"));
     }
 
-    exports.Set("openProcess",       Napi::Function::New(env, OpenProcessWrapped));
-    exports.Set("closeHandle",       Napi::Function::New(env, CloseHandleWrapped));
-    exports.Set("readMemory",        Napi::Function::New(env, ReadMemoryWrapped));
-    exports.Set("findPidsByExeName", Napi::Function::New(env, FindPidsWrapped));
-    exports.Set("findServicePid",    Napi::Function::New(env, FindServiceWrapped));
-    exports.Set("scanStrings",       Napi::Function::New(env, ScanStringsWrapped));
+    exports.Set("openProcess", Napi::Function::New(env, openProcess));
+    exports.Set("closeHandle", Napi::Function::New(env, closeHandle));
+    exports.Set("readMemory", Napi::Function::New(env, readMemory));
+    exports.Set("findPidsByExeName", Napi::Function::New(env, findPidsByExeName));
+    exports.Set("findServicePid", Napi::Function::New(env, findServicePid));
+    exports.Set("scanStrings", Napi::Function::New(env, scanStrings));
 
     return exports;
 }
 
-NODE_API_MODULE(memory, Init);
+NODE_API_MODULE(memory, init)
