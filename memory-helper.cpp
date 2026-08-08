@@ -1,20 +1,20 @@
 #define _CRT_SECURE_NO_WARNINGS
+
 #include <windows.h>
 #include <tlhelp32.h>
 #include <winsvc.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-// ============================================================
-// Shared types (must match memory.cc)
-// ============================================================
+/* Keep this in sync with the Node addon. */
 typedef struct {
     UINT64 start;
     UINT64 end;
     UINT32 minLen;
-    BOOL   ascii;
-    BOOL   utf16;
-    BOOL   caseSensitive;
+    BOOL ascii;
+    BOOL utf16;
+    BOOL caseSensitive;
     const char *contains;
     SIZE_T maxResults;
 } ScanStringOptions;
@@ -25,284 +25,290 @@ typedef void (*ScanCallback)(UINT64 addr, const char *text, const char *encoding
 extern "C" {
 #endif
 
-// ============================================================
-// Enable SeDebugPrivilege (DFIR standard for scanning)
-// ============================================================
-static void EnableDebugPrivilegeOnce(void) {
-    static int done = 0;
-    if (done) return;
-    done = 1;
+static void enableDebugPrivilege(void)
+{
+    static BOOL attempted = FALSE;
+    if (attempted)
+        return;
 
-    HANDLE hToken = NULL;
+    attempted = TRUE;
+
+    HANDLE token = NULL;
     if (!OpenProcessToken(GetCurrentProcess(),
                           TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                          &hToken)) {
+                          &token)) {
         return;
     }
 
     LUID luid;
-    if (!LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &luid)) {
-        CloseHandle(hToken);
-        return;
+    if (LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &luid)) {
+        TOKEN_PRIVILEGES privileges = {0};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        AdjustTokenPrivileges(token, FALSE, &privileges,
+                              sizeof(privileges), NULL, NULL);
     }
 
-    TOKEN_PRIVILEGES tp;
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
-    CloseHandle(hToken);
+    CloseHandle(token);
 }
 
-// ============================================================
-// EXPORT: OpenProcessForNode
-// ============================================================
 __declspec(dllexport)
-HANDLE OpenProcessForNode(DWORD pid) {
-    EnableDebugPrivilegeOnce();
+HANDLE OpenProcessForNode(DWORD pid)
+{
+    enableDebugPrivilege();
 
-    HANDLE h = OpenProcess(
+    return OpenProcess(
         PROCESS_QUERY_INFORMATION |
+        PROCESS_QUERY_LIMITED_INFORMATION |
         PROCESS_VM_READ |
-        PROCESS_VM_OPERATION |
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_VM_OPERATION,
         FALSE,
         pid
     );
-
-    return h;
 }
 
-// ============================================================
-// EXPORT: CloseHandleForNode
-// ============================================================
 __declspec(dllexport)
-BOOL CloseHandleForNode(HANDLE h) {
-    if (!h) return FALSE;
-    return CloseHandle(h);
+BOOL CloseHandleForNode(HANDLE handle)
+{
+    return handle ? CloseHandle(handle) : FALSE;
 }
 
-// ============================================================
-// EXPORT: ReadMemoryForNode
-// ============================================================
 __declspec(dllexport)
-BOOL ReadMemoryForNode(
-    HANDLE hProcess,
-    LPCVOID addr,
-    LPVOID buf,
-    SIZE_T size,
-    SIZE_T *lpBytesRead
-) {
-    if (!hProcess || !addr || !buf || !lpBytesRead) return FALSE;
-    return ReadProcessMemory(hProcess, addr, buf, size, lpBytesRead);
+BOOL ReadMemoryForNode(HANDLE process,
+                       LPCVOID address,
+                       LPVOID buffer,
+                       SIZE_T size,
+                       SIZE_T *bytesRead)
+{
+    if (!process || !address || !buffer || !bytesRead)
+        return FALSE;
+
+    return ReadProcessMemory(process, address, buffer, size, bytesRead);
 }
 
-// ============================================================
-// EXPORT: FindPidsByExeNameA
-// ============================================================
 __declspec(dllexport)
-DWORD FindPidsByExeNameA(
-    const char *exeName,
-    DWORD *outPids,
-    DWORD maxCount,
-    BOOL caseInsensitive
-) {
+DWORD FindPidsByExeNameA(const char *exeName,
+                         DWORD *outPids,
+                         DWORD maxCount,
+                         BOOL caseInsensitive)
+{
     if (!exeName || !outPids || maxCount == 0)
         return 0;
 
-    EnableDebugPrivilegeOnce();
+    enableDebugPrivilege();
 
-    wchar_t wExe[260];
-    MultiByteToWideChar(CP_UTF8, 0, exeName, -1, wExe, 260);
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE)
+    wchar_t target[260] = {0};
+    if (!MultiByteToWideChar(CP_UTF8, 0, exeName, -1, target, 260))
         return 0;
 
-    PROCESSENTRY32W pe;
-    pe.dwSize = sizeof(pe);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return 0;
 
-    DWORD matches = 0;
-    if (Process32FirstW(snap, &pe)) {
+    PROCESSENTRY32W entry = {0};
+    entry.dwSize = sizeof(entry);
+
+    DWORD count = 0;
+
+    if (Process32FirstW(snapshot, &entry)) {
         do {
-            BOOL match;
-            if (caseInsensitive)
-                match = (_wcsicmp(pe.szExeFile, wExe) == 0);
-            else
-                match = (wcscmp(pe.szExeFile, wExe) == 0);
+            int cmp = caseInsensitive
+                ? _wcsicmp(entry.szExeFile, target)
+                : wcscmp(entry.szExeFile, target);
 
-            if (match) {
-                if (matches < maxCount)
-                    outPids[matches] = pe.th32ProcessID;
-                matches++;
+            if (cmp == 0) {
+                if (count < maxCount)
+                    outPids[count] = entry.th32ProcessID;
+                ++count;
             }
-        } while (Process32NextW(snap, &pe));
+        } while (Process32NextW(snapshot, &entry));
     }
 
-    CloseHandle(snap);
-    return matches;
+    CloseHandle(snapshot);
+    return count;
 }
 
-// ============================================================
-// EXPORT: FindServicePidA
-// ============================================================
 __declspec(dllexport)
-DWORD FindServicePidA(const char *serviceName) {
-    if (!serviceName) return 0;
+DWORD FindServicePidA(const char *serviceName)
+{
+    if (!serviceName)
+        return 0;
 
-    EnableDebugPrivilegeOnce();
+    enableDebugPrivilege();
 
-    wchar_t wName[256];
-    MultiByteToWideChar(CP_UTF8, 0, serviceName, -1, wName, 256);
+    wchar_t serviceNameW[256] = {0};
+    if (!MultiByteToWideChar(CP_UTF8, 0, serviceName, -1,
+                             serviceNameW, 256)) {
+        return 0;
+    }
 
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-    if (!scm) return 0;
+    if (!scm)
+        return 0;
 
-    SC_HANDLE svc = OpenServiceW(scm, wName, SERVICE_QUERY_STATUS);
-    if (!svc) {
+    SC_HANDLE service = OpenServiceW(scm, serviceNameW, SERVICE_QUERY_STATUS);
+    if (!service) {
         CloseServiceHandle(scm);
         return 0;
     }
 
-    SERVICE_STATUS_PROCESS ssp;
-    DWORD bytes = 0;
-
+    SERVICE_STATUS_PROCESS status = {0};
+    DWORD needed = 0;
     DWORD pid = 0;
-    if (QueryServiceStatusEx(svc,
+
+    if (QueryServiceStatusEx(service,
                              SC_STATUS_PROCESS_INFO,
-                             (LPBYTE)&ssp,
-                             sizeof(ssp),
-                             &bytes)) {
-        pid = ssp.dwProcessId;
+                             (LPBYTE)&status,
+                             sizeof(status),
+                             &needed)) {
+        pid = status.dwProcessId;
     }
 
-    CloseServiceHandle(svc);
+    CloseServiceHandle(service);
     CloseServiceHandle(scm);
-
     return pid;
 }
 
-// ============================================================
-// Helper: check substring (case-sensitive or insensitive)
-// ============================================================
-static BOOL ContainsSubstring(const char *haystack,
-                              const char *needle,
-                              BOOL caseSensitive) {
-    if (!needle || !*needle) return TRUE;
-    if (!haystack) return FALSE;
+static BOOL containsText(const char *text,
+                         const char *needle,
+                         BOOL caseSensitive)
+{
+    if (!needle || !*needle)
+        return TRUE;
+    if (!text)
+        return FALSE;
 
-    if (caseSensitive) {
-        return strstr(haystack, needle) != NULL;
-    }
+    if (caseSensitive)
+        return strstr(text, needle) != NULL;
 
-    // case-insensitive: naive implementation
-    size_t hlen = strlen(haystack);
-    size_t nlen = strlen(needle);
-    if (nlen == 0) return TRUE;
-    if (nlen > hlen) return FALSE;
+    size_t textLen = strlen(text);
+    size_t needleLen = strlen(needle);
 
-    for (size_t i = 0; i + nlen <= hlen; ++i) {
+    if (needleLen > textLen)
+        return FALSE;
+
+    for (size_t i = 0; i + needleLen <= textLen; ++i) {
         size_t j = 0;
-        for (; j < nlen; ++j) {
-            char c1 = haystack[i + j];
-            char c2 = needle[j];
-            if (c1 >= 'A' && c1 <= 'Z') c1 = (char)(c1 - 'A' + 'a');
-            if (c2 >= 'A' && c2 <= 'Z') c2 = (char)(c2 - 'A' + 'a');
-            if (c1 != c2) break;
+
+        for (; j < needleLen; ++j) {
+            char a = text[i + j];
+            char b = needle[j];
+
+            if (a >= 'A' && a <= 'Z')
+                a = (char)(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z')
+                b = (char)(b + ('a' - 'A'));
+
+            if (a != b)
+                break;
         }
-        if (j == nlen) return TRUE;
+
+        if (j == needleLen)
+            return TRUE;
     }
+
     return FALSE;
 }
 
-// ============================================================
-// EXPORT: ScanStringsForNode (ASCII scanning)
-//   NOTE: UTF-16 scanning is not implemented here yet; 'utf16'
-//   option is currently ignored and everything is treated as ASCII.
-// ============================================================
 __declspec(dllexport)
-DWORD ScanStringsForNode(
-    HANDLE hProc,
-    ScanStringOptions *opt,
-    ScanCallback cb
-) {
-    if (!hProc || !opt || !cb) return 0;
+DWORD ScanStringsForNode(HANDLE process,
+                         ScanStringOptions *options,
+                         ScanCallback callback)
+{
+    if (!process || !options || !callback)
+        return 0;
 
-    EnableDebugPrivilegeOnce();
+    enableDebugPrivilege();
 
-    UINT64 current = opt->start;
-    UINT64 end     = (opt->end == 0 ? 0x7fffffffffffULL : opt->end);
+    UINT64 address = options->start;
+    UINT64 scanEnd = options->end ? options->end : 0x7fffffffffffULL;
+    DWORD resultCount = 0;
 
-    DWORD hits = 0;
+    while (address < scanEnd && resultCount < options->maxResults) {
+        MEMORY_BASIC_INFORMATION mbi = {0};
 
-    while (current < end && hits < opt->maxResults) {
-        MEMORY_BASIC_INFORMATION mbi;
-        SIZE_T res = VirtualQueryEx(
-            hProc,
-            (LPCVOID)(UINT_PTR)current,
-            &mbi,
-            sizeof(mbi)
-        );
-        if (!res) break;
+        if (!VirtualQueryEx(process,
+                            (LPCVOID)(UINT_PTR)address,
+                            &mbi,
+                            sizeof(mbi))) {
+            break;
+        }
 
-        UINT64 base = (UINT64)(UINT_PTR)mbi.BaseAddress;
-        UINT64 size = (UINT64)mbi.RegionSize;
-        current = base + size;
+        UINT64 regionBase = (UINT64)(UINT_PTR)mbi.BaseAddress;
+        UINT64 regionSize = (UINT64)mbi.RegionSize;
+        address = regionBase + regionSize;
 
-        if (mbi.State != MEM_COMMIT) continue;
-        if (mbi.Protect & PAGE_NOACCESS) continue;
-        if (mbi.Protect & PAGE_GUARD) continue;
-        if (size == 0) continue;
+        if (regionSize == 0 || mbi.State != MEM_COMMIT)
+            continue;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+            continue;
 
-        // Clamp size to something reasonable to avoid giant allocations
-        const UINT64 MAX_CHUNK = 16 * 1024 * 1024; // 16 MB
-        if (size > MAX_CHUNK) size = MAX_CHUNK;
+        /* Avoid trying to allocate an entire unusually large region at once. */
+        const UINT64 maxRegionRead = 16ULL * 1024ULL * 1024ULL;
+        SIZE_T bytesToRead = (SIZE_T)(regionSize > maxRegionRead
+            ? maxRegionRead
+            : regionSize);
 
-        void *buffer = malloc((SIZE_T)size);
-        if (!buffer) continue;
+        char *buffer = (char *)malloc(bytesToRead);
+        if (!buffer)
+            continue;
 
-        SIZE_T br = 0;
-        if (!ReadProcessMemory(hProc,
-                               (LPCVOID)(UINT_PTR)base,
-                               buffer,
-                               (SIZE_T)size,
-                               &br) || br == 0) {
+        SIZE_T bytesRead = 0;
+        BOOL readOk = ReadProcessMemory(process,
+                                        (LPCVOID)(UINT_PTR)regionBase,
+                                        buffer,
+                                        bytesToRead,
+                                        &bytesRead);
+
+        if (!readOk || bytesRead == 0) {
             free(buffer);
             continue;
         }
 
-        char *p = (char *)buffer;
-        SIZE_T i = 0;
+        SIZE_T pos = 0;
 
-        while (i < br && hits < opt->maxResults) {
-            if (opt->ascii) {
-                SIZE_T s = i;
-                // printable ASCII range
-                while (s < br && p[s] >= 0x20 && p[s] <= 0x7E) s++;
-
-                SIZE_T len = s - i;
-                if (len >= opt->minLen) {
-                    char tmp[512];
-                    SIZE_T copyLen = (len < (SIZE_T)511 ? len : (SIZE_T)511);
-                    memcpy(tmp, &p[i], copyLen);
-                    tmp[copyLen] = 0;
-
-                    if (ContainsSubstring(tmp, opt->contains, opt->caseSensitive)) {
-                        cb(base + i, tmp, "ascii");
-                        hits++;
-                    }
-                }
-                i = s + 1;
-            } else {
-                i++;
+        while (pos < bytesRead && resultCount < options->maxResults) {
+            if (!options->ascii) {
+                ++pos;
+                continue;
             }
+
+            SIZE_T end = pos;
+            while (end < bytesRead &&
+                   buffer[end] >= 0x20 &&
+                   buffer[end] <= 0x7e) {
+                ++end;
+            }
+
+            SIZE_T length = end - pos;
+            if (length >= options->minLen) {
+                char text[512];
+                SIZE_T copyLen = length < sizeof(text) - 1
+                    ? length
+                    : sizeof(text) - 1;
+
+                memcpy(text, buffer + pos, copyLen);
+                text[copyLen] = '\0';
+
+                if (containsText(text,
+                                 options->contains,
+                                 options->caseSensitive)) {
+                    callback(regionBase + pos, text, "ascii");
+                    ++resultCount;
+                }
+            }
+
+            pos = (end < bytesRead) ? end + 1 : end;
         }
 
         free(buffer);
     }
 
-    return hits;
+    /* UTF-16 is kept in the public options for compatibility, but is not
+       scanned by this implementation yet. */
+    return resultCount;
 }
 
 #ifdef __cplusplus
